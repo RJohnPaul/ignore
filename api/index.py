@@ -22,6 +22,9 @@ model = genai.GenerativeModel('gemini-1.5-flash')
 # NewsAPI fallback
 NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "dd52e9d920b247e1b51fa8c08ca5b662")  # Get your free key from newsapi.org
 
+# Set default socket timeout for all connections
+socket.setdefaulttimeout(5.0)  # Reduce timeout from 15s to 5s
+
 app = FastAPI(docs_url="/api/docs", openapi_url="/api/openapi.json")
 
 # Enable CORS for frontend requests
@@ -806,15 +809,12 @@ def extract_image_from_entry(entry):
     
     return None
 
-def fetch_rss_feed(feed_url, category=None, max_retries=3):
+def fetch_rss_feed(feed_url, category=None, max_retries=2):
     """Fetch articles from a single RSS feed with retry logic"""
     for retry in range(max_retries):
         try:
-            # Set socket timeout for this request
-            socket.setdefaulttimeout(15)
-            
-            # Parse the feed
-            feed = feedparser.parse(feed_url)
+            # Parse the feed with a short timeout
+            feed = feedparser.parse(feed_url, timeout=3)
             
             # Check if feed has entries
             if not hasattr(feed, 'entries') or len(feed.entries) == 0:
@@ -826,11 +826,11 @@ def fetch_rss_feed(feed_url, category=None, max_retries=3):
             source_name = NEWS_SOURCE_NAMES.get(domain, feed.feed.title if hasattr(feed.feed, 'title') else domain)
             source_image = DEFAULT_SOURCE_IMAGES.get(source_name, DEFAULT_SOURCE_IMAGES["default"])
             
-            # Process each entry
+            # Process each entry - limit to 10 most recent entries for performance
             articles = []
-            for entry in feed.entries:
+            for entry in feed.entries[:10]:
                 try:
-                    # Extract and clean data
+                    # Extract and clean data - only basics for speed
                     title = entry.title if hasattr(entry, 'title') else ""
                     title = re.sub(r'<.*?>', '', title)  # Remove HTML tags
                     
@@ -845,8 +845,11 @@ def fetch_rss_feed(feed_url, category=None, max_retries=3):
                         except:
                             pass
                     
-                    # Extract image if available
-                    image_url = extract_image_from_entry(entry) or source_image
+                    # Simple image extraction (skip complex extraction for performance)
+                    image_url = None
+                    if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
+                        image_url = entry.media_thumbnail[0]['url']
+                    image_url = image_url or source_image
                     
                     # Create article object
                     article = {
@@ -864,7 +867,6 @@ def fetch_rss_feed(feed_url, category=None, max_retries=3):
                     print(f"Error processing entry from {feed_url}: {e}")
                     continue
             
-            print(f"Fetched {len(articles)} articles from {feed_url}")
             return articles
         
         except Exception as e:
@@ -873,7 +875,7 @@ def fetch_rss_feed(feed_url, category=None, max_retries=3):
                 return []
             else:
                 print(f"Retrying {feed_url} ({retry+2}/{max_retries})...")
-                time.sleep(1)  # Wait before retrying
+                time.sleep(0.5)  # Reduced wait time between retries
 
 async def fetch_news_api(query, language, category=None, fallback=True):
     """Fetch news from NewsAPI as a fallback"""
@@ -958,15 +960,19 @@ async def fetch_news_api(query, language, category=None, fallback=True):
         print(f"Error fetching from NewsAPI: {e}")
         return []
 
-def fetch_all_feeds(feed_urls, category=None, max_workers=12):
+def fetch_all_feeds(feed_urls, category=None, max_workers=8):
     """Fetch articles from multiple RSS feeds concurrently"""
     all_articles = []
     successful_feeds = 0
     
-    # Use ThreadPoolExecutor for concurrent fetching
+    # Limit the number of feeds to fetch for faster response time
+    # Only take a subset of feeds that are more likely to respond quickly
+    limited_feeds = feed_urls[:min(5, len(feed_urls))]
+    
+    # Use ThreadPoolExecutor for concurrent fetching with fewer workers
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all feed fetching tasks
-        future_to_url = {executor.submit(fetch_rss_feed, url, category): url for url in feed_urls}
+        future_to_url = {executor.submit(fetch_rss_feed, url, category): url for url in limited_feeds}
         
         # Process results as they complete
         for future in as_completed(future_to_url):
@@ -976,18 +982,22 @@ def fetch_all_feeds(feed_urls, category=None, max_workers=12):
                 if articles:
                     all_articles.extend(articles)
                     successful_feeds += 1
+                    # If we have enough articles already, don't wait for more feeds
+                    if len(all_articles) > 30:
+                        break
             except Exception as e:
                 print(f"Error processing results from {url}: {e}")
     
-    print(f"Successfully fetched from {successful_feeds}/{len(feed_urls)} feeds for {category if category else 'general'}")
+    print(f"Successfully fetched from {successful_feeds}/{len(limited_feeds)} feeds (out of {len(feed_urls)} total feeds)")
     print(f"Total articles collected: {len(all_articles)}")
     
-    # Remove duplicates (by title)
+    # Improved deduplication with faster title-based matching
     unique_articles = {}
     for article in all_articles:
         # Use title as a deduplication key
-        if article["title"] not in unique_articles:
-            unique_articles[article["title"]] = article
+        title = article["title"].lower()[:50]  # Use first 50 chars for faster comparison
+        if title not in unique_articles:
+            unique_articles[title] = article
     
     print(f"Unique articles after deduplication: {len(unique_articles)}")
     return list(unique_articles.values())
@@ -1021,112 +1031,81 @@ Return ONLY the single most relevant category name from the list.
         return None
 
 # Gemini 1.5 Flash inspired search enhancement
-def advanced_semantic_search(articles, query, threshold=0.2):
+def advanced_semantic_search(articles, query, threshold=0.1):
     """
-    Enhanced search function inspired by Gemini 1.5 Flash capabilities.
-    This simulates semantic search with more advanced term matching.
-    
-    In a real implementation with Gemini API, you would:
-    1. Use embeddings from Gemini for articles and query
-    2. Calculate semantic similarity
-    3. Rank results based on semantic understanding
+    Optimized search function for faster retrieval times
     """
     if not query:
         return articles, 0
     
     # Normalize the query
     query_lower = query.lower()
-    query_terms = query_lower.split()
+    query_terms = set(query_lower.split())  # Using a set for faster lookups
     
-    # Special case for common topics
-    is_sports_query = any(term in query_lower for term in ["vs", "cricket", "ipl", "match", "game", "score", "sport"])
-    is_politics_query = any(term in query_lower for term in ["election", "vote", "minister", "government", "party", "bjp", "congress"])
-    is_tech_query = any(term in query_lower for term in ["ai", "tech", "digital", "app", "mobile", "apple", "google"])
-    is_finance_query = any(term in query_lower for term in ["market", "stock", "finance", "bank", "economy", "rupee", "dollar"])
-    
-    # Special entities (like team acronyms for cricket)
-    team_acronyms = ["csk", "mi", "rcb", "kkr", "srh", "dc", "pbks", "rr", "gt", "lsg"]
-    political_parties = ["bjp", "congress", "aap", "tmc", "sp", "ncp", "rjd", "jdu", "dmk", "aiadmk"]
-    
-    # Enhanced matching based on multiple factors
-    scored_articles = []
-    
-    # First pass - identify potentially relevant articles
+    # Fast pre-filtering based on title match
+    fast_matches = []
     for article in articles:
         title_lower = article["title"].lower()
+        # Quick check if any query term is in the title - fast path
+        if any(term in title_lower for term in query_terms):
+            article["relevance"] = 0.7  # High initial relevance for title matches
+            fast_matches.append(article)
+    
+    # If we found enough title matches, return them immediately
+    if len(fast_matches) >= 10:
+        return fast_matches, len(fast_matches)
+    
+    # Otherwise proceed with more detailed matching
+    scored_articles = []
+    
+    # Simple categorization for speed
+    is_sports = any(term in query_lower for term in ["cricket", "football", "sport", "match", "ipl"])
+    is_tech = any(term in query_lower for term in ["tech", "ai", "digital", "app", "mobile"])
+    is_politics = any(term in query_lower for term in ["election", "minister", "government"])
+    is_finance = any(term in query_lower for term in ["market", "finance", "stock", "economy"])
+    
+    # Process each article with a simplified algorithm
+    for article in articles:
+        # Skip articles already in fast_matches
+        if article in fast_matches:
+            continue
+            
+        title_lower = article["title"].lower()
         summary_lower = article["summary"].lower()
-        combined_text = f"{title_lower} {summary_lower}"
         
-        # Calculate various relevance signals
-        exact_query_match = query_lower in combined_text
+        # Quick scoring system
+        score = 0.0
         
-        # Term matching - count how many query terms appear in the text
-        term_matches = sum(1 for term in query_terms if term in combined_text)
-        term_match_ratio = term_matches / max(1, len(query_terms))
+        # Title matches are important
+        title_matches = sum(1 for term in query_terms if term in title_lower)
+        if title_matches > 0:
+            score += 0.4 * (title_matches / len(query_terms))
         
-        # Check for special entities based on query type
-        special_entity_matches = 0
-        if is_sports_query:
-            special_entity_matches = sum(1 for team in team_acronyms if team in combined_text.lower())
-        elif is_politics_query:
-            special_entity_matches = sum(1 for party in political_parties if party in combined_text.lower())
-        
-        # Title matching has higher weight
-        title_term_matches = sum(1 for term in query_terms if term in title_lower)
-        title_match_ratio = title_term_matches / max(1, len(query_terms))
-        
-        # Calculate final relevance score (emulating semantic matching)
-        relevance_score = 0
-        
-        if exact_query_match:
-            relevance_score += 0.6  # Increased weight for exact matches
-        
-        relevance_score += 0.3 * term_match_ratio
-        relevance_score += 0.5 * title_match_ratio  # Increased weight for title matches
-        
-        # Special query type bonus
-        if (is_sports_query and "sport" in combined_text) or \
-           (is_politics_query and "politic" in combined_text) or \
-           (is_tech_query and "tech" in combined_text) or \
-           (is_finance_query and "finance" in combined_text or "market" in combined_text):
-            relevance_score += 0.2
-        
-        if special_entity_matches > 0:
-            relevance_score += 0.1 * min(1.0, special_entity_matches)
-        
-        # Date recency bonus (up to 0.2)
-        try:
-            pub_date = datetime.fromisoformat(article["published_date"].replace('Z', '+00:00'))
-            current_date = datetime.now()
-            days_old = (current_date - pub_date).days
-            recency_bonus = max(0, 0.2 - (days_old * 0.04))  # Stronger recency bonus
-            relevance_score += recency_bonus
-        except:
-            pass
-        
-        # Category matching bonus
-        if "category" in article and article["category"]:
-            category_terms = article["category"].lower().split()
-            if any(term in query_lower for term in category_terms):
-                relevance_score += 0.3  # Significant bonus for category match
-        
-        # Paragraph length bonus (slight preference for more detailed articles)
-        summary_length = len(summary_lower.split())
-        if summary_length > 50:  # Prefer articles with substantial summaries
-            relevance_score += 0.05
-        
-        # Normalize final score
-        relevance_score = min(1.0, relevance_score)
-        
-        # Include article if it has any relevance
-        if relevance_score > threshold or term_matches > 0:
-            article["relevance"] = relevance_score
+        # Content match
+        if any(term in summary_lower for term in query_terms):
+            score += 0.3
+            
+        # Exact phrase match in either title or summary
+        if query_lower in title_lower or query_lower in summary_lower:
+            score += 0.5
+            
+        # Category match bonus
+        if (is_sports and article.get("category") in ["Sports", "Cricket", "Football"]) or \
+           (is_tech and article.get("category") in ["Tech", "Programming", "Android", "Apple"]) or \
+           (is_politics and article.get("category") == "News") or \
+           (is_finance and article.get("category") in ["Business & Economy", "Personal Finance"]):
+            score += 0.2
+            
+        # Keep article if it meets threshold
+        if score > threshold:
+            article["relevance"] = score
             scored_articles.append(article)
     
-    # Sort by relevance score
-    scored_articles.sort(key=lambda x: x.get("relevance", 0), reverse=True)
+    # Combine results and sort
+    combined_results = fast_matches + scored_articles
+    combined_results.sort(key=lambda x: x.get("relevance", 0), reverse=True)
     
-    return scored_articles, len(scored_articles)
+    return combined_results, len(combined_results)
 
 # Simulated Gemini function that would be used if API were connected
 def gemini_enhanced_search(articles, query):
@@ -1165,96 +1144,80 @@ async def get_news(request: NewsRequest):
         preferred_sources = request.preferred_sources
         category = request.category
         
-        # If no category is specified but we have a query, try to determine the best category
-        if not category and query:
+        # Skip category detection for empty queries to save time
+        if not category and query and len(query) > 2:
+            # Only use category detection for substantial queries
             category = await determine_category_for_query(query)
         
-        # Fetch articles based on category and language
-        if category:
-            # Check if the category exists
-            if category not in RSS_FEEDS:
-                return NewsResponse(
-                    articles=[],
-                    message=f"Category '{category}' not found. Please try one of the available categories.",
-                    total_found=0,
-                    total_pages=0,
-                    current_page=page,
-                    available_sources=[],
-                    available_categories=list(RSS_FEEDS.keys())
-                )
-            
-            # Check cache for this specific category and language
-            cache_key = f"{language}-{category}"
-            current_time = time.time()
-            
-            if cache_key in NEWS_CACHE and (current_time - NEWS_CACHE[cache_key]["timestamp"] < CACHE_EXPIRY):
-                print(f"Using cached news data for {language} - {category}")
-                articles = NEWS_CACHE[cache_key]["articles"]
-            else:
-                # Check if the language is supported for this category
-                if language not in RSS_FEEDS[category]:
-                    # Try to fall back to English
-                    if "en" in RSS_FEEDS[category]:
-                        language = "en"
-                        print(f"Language {request.language} not available for {category}, falling back to English")
-                    else:
-                        return NewsResponse(
-                            articles=[],
-                            message=f"Language {request.language} not available for category '{category}'.",
-                            total_found=0,
-                            total_pages=0,
-                            current_page=page,
-                            available_sources=[],
-                            available_categories=list(RSS_FEEDS.keys())
-                        )
-                
-                # Get feeds for this category and language
-                feeds = RSS_FEEDS[category][language]
-                
-                # Fetch articles from the feeds
-                articles = fetch_all_feeds(feeds, category=category)
-                
-                # If we have few results, try to get more from NewsAPI
-                if len(articles) < 10:
-                    news_api_articles = await fetch_news_api(query, language, category=category)
-                    articles.extend(news_api_articles)
-                
-                # Cache the results
-                NEWS_CACHE[cache_key] = {
-                    "timestamp": current_time,
-                    "articles": articles
-                }
-        else:
-            # No specific category, fetch from general news
-            cache_key = f"{language}-all"
-            current_time = time.time()
-            
-            if cache_key in NEWS_CACHE and (current_time - NEWS_CACHE[cache_key]["timestamp"] < CACHE_EXPIRY):
-                print(f"Using cached general news data for {language}")
-                articles = NEWS_CACHE[cache_key]["articles"]
-            else:
-                # Get general news feeds for this language
-                if language in RSS_FEEDS["News"]:
-                    feeds = RSS_FEEDS["News"][language]
-                    articles = fetch_all_feeds(feeds, category="News")
-                else:
-                    # Fallback to English if the language is not supported
-                    feeds = RSS_FEEDS["News"]["en"]
-                    articles = fetch_all_feeds(feeds, category="News")
-                    print(f"Language {language} not available, falling back to English")
-                
-                # Try to get additional articles from NewsAPI if we have few results
-                if len(articles) < 30:
-                    news_api_articles = await fetch_news_api(query, language)
-                    articles.extend(news_api_articles)
-                
-                # Cache the results
-                NEWS_CACHE[cache_key] = {
-                    "timestamp": current_time,
-                    "articles": articles
-                }
+        # Check cache first - with a simplified key structure
+        cache_key = f"{language}-{category or 'all'}-{query[:20]}"
+        current_time = time.time()
         
-        # Get unique list of available sources for this language
+        # Fast path: Return cached results if available
+        if cache_key in NEWS_CACHE and (current_time - NEWS_CACHE[cache_key]["timestamp"] < CACHE_EXPIRY):
+            cached_data = NEWS_CACHE[cache_key]
+            
+            # Calculate pagination directly from cache
+            total_matches = len(cached_data["articles"])
+            total_pages = (total_matches + page_size - 1) // page_size
+            start_idx = (page - 1) * page_size
+            end_idx = min(start_idx + page_size, total_matches)
+            
+            # Get requested page of articles
+            paged_articles = cached_data["articles"][start_idx:end_idx]
+            
+            category_msg = f" in {category}" if category else ""
+            message = f"Found {total_matches} articles matching '{query}'{category_msg}." if query else f"Showing {min(page_size, total_matches)} recent news articles{category_msg}."
+            
+            return NewsResponse(
+                articles=paged_articles,
+                message=message,
+                total_found=total_matches,
+                total_pages=total_pages,
+                current_page=page,
+                available_sources=cached_data.get("available_sources", []),
+                available_categories=list(RSS_FEEDS.keys())
+            )
+        
+        # Not in cache, need to fetch new data
+        articles = []
+        
+        # Fetch articles based on category or from general news
+        if category and category in RSS_FEEDS:
+            # Check if the language is supported for this category
+            if language not in RSS_FEEDS[category]:
+                # Try to fall back to English
+                if "en" in RSS_FEEDS[category]:
+                    language = "en"
+                else:
+                    return NewsResponse(
+                        articles=[],
+                        message=f"Language {request.language} not available for category '{category}'.",
+                        total_found=0,
+                        total_pages=0,
+                        current_page=page,
+                        available_sources=[],
+                        available_categories=list(RSS_FEEDS.keys())
+                    )
+            
+            # Get feeds and fetch articles
+            feeds = RSS_FEEDS[category][language]
+            articles = fetch_all_feeds(feeds, category=category)
+        else:
+            # Get general news feeds for this language or fall back to English
+            if language in RSS_FEEDS["News"]:
+                feeds = RSS_FEEDS["News"][language]
+            else:
+                feeds = RSS_FEEDS["News"]["en"]
+            
+            articles = fetch_all_feeds(feeds, category="News")
+        
+        # Only try NewsAPI if we have few results and there's a query
+        if len(articles) < 10 and query:
+            news_api_articles = await fetch_news_api(query, language, category=category)
+            articles.extend(news_api_articles)
+        
+        # Extract available sources
         available_sources = []
         source_set = set()
         for article in articles:
@@ -1263,57 +1226,41 @@ async def get_news(request: NewsRequest):
                 source_set.add(source_name)
                 available_sources.append(source_name)
         
-        # Filter by preferred sources if specified
+        # Apply source filtering
         if preferred_sources and len(preferred_sources) > 0:
-            articles = [a for a in articles if any(
+            filtered_by_source = [a for a in articles if any(
                 ps.lower() in a["source"]["name"].lower() for ps in preferred_sources
             )]
-            if not articles:
-                return NewsResponse(
-                    articles=[],
-                    message=f"No articles found from your preferred sources. Try selecting different sources.",
-                    total_found=0,
-                    total_pages=0,
-                    current_page=page,
-                    available_sources=available_sources,
-                    available_categories=list(RSS_FEEDS.keys())
-                )
+            if filtered_by_source:
+                articles = filtered_by_source
         
-        print(f"Total articles after source filtering: {len(articles)}")
-        
-        # Apply Gemini-inspired search (in production, would use gemini_enhanced_search)
+        # Apply search filtering only if there's a query
         if query:
             filtered_articles, total_matches = advanced_semantic_search(articles, query)
             
-            if filtered_articles:
-                category_msg = f" in {category}" if category else ""
-                message = f"Found {total_matches} articles matching '{query}'{category_msg}."
-            else:
-                # Fallback to date-sorted articles
+            if not filtered_articles:
                 filtered_articles = sorted(articles, key=lambda x: x.get("published_date", ""), reverse=True)
                 total_matches = len(filtered_articles)
                 category_msg = f" in {category}" if category else ""
                 message = f"No exact matches for '{query}'{category_msg}. Showing recent articles instead."
+            else:
+                category_msg = f" in {category}" if category else ""
+                message = f"Found {total_matches} articles matching '{query}'{category_msg}."
         else:
-            # Sort by published date (newest first) if no query
+            # No query, just sort by date
             filtered_articles = sorted(articles, key=lambda x: x.get("published_date", ""), reverse=True)
             total_matches = len(filtered_articles)
             category_msg = f" in {category}" if category else ""
             message = f"Showing {min(page_size, total_matches)} recent news articles{category_msg}."
         
-        # If no articles after all filtering, provide a clear message
-        if not filtered_articles:
-            return NewsResponse(
-                articles=[],
-                message="No news articles found. Please try a different search query, category, or language selection.",
-                total_found=0,
-                total_pages=0,
-                current_page=page,
-                available_sources=available_sources,
-                available_categories=list(RSS_FEEDS.keys())
-            )
+        # Store in cache for future requests - include available_sources
+        NEWS_CACHE[cache_key] = {
+            "timestamp": current_time,
+            "articles": filtered_articles,
+            "available_sources": available_sources
+        }
         
-        # Calculate pagination
+        # Final pagination
         total_pages = (total_matches + page_size - 1) // page_size
         start_idx = (page - 1) * page_size
         end_idx = min(start_idx + page_size, total_matches)
@@ -1324,7 +1271,7 @@ async def get_news(request: NewsRequest):
         # Ensure all articles have a relevance score for UI
         for article in paged_articles:
             if "relevance" not in article:
-                article["relevance"] = 0.5  # Default score
+                article["relevance"] = 0.5
         
         return NewsResponse(
             articles=paged_articles,
@@ -1337,6 +1284,7 @@ async def get_news(request: NewsRequest):
         )
     
     except Exception as e:
+        print(f"Error in get_news: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing news: {str(e)}")
 
 # Add utility function for vector similarity (for Gemini embeddings)
